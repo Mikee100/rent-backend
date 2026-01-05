@@ -1,0 +1,35 @@
+{
+  "name": "rent-management-backend",
+  "version": "1.0.0",
+  "description": "Backend for Rent Management System",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "seed": "node scripts/seedApartments.js",
+    "seed-houses": "node scripts/seedHouses.js",
+    "test-connection": "node scripts/testConnection.js",
+    "create-admin": "node scripts/createSuperadmin.js"
+  },
+  "keywords": [
+    "rent",
+    "management",
+    "express",
+    "mongodb"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^8.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
