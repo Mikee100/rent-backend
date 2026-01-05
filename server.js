@@ -62,7 +62,19 @@ const app = express();
 const PORT = process.env.PORT || 7000;
 
 // Middleware
-app.use(cors());
+// CORS configuration - allow requests from Vercel frontend and localhost for development
+const corsOptions = {
+  origin: [
+    'https://rentmanagement-three.vercel.app',
+    'http://localhost:3000',
+    'http://localhost:5173', // Vite default port
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
