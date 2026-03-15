@@ -71,12 +71,22 @@ router.get('/:id', authenticate, filterByApartment, async (req, res) => {
 });
 
 // Create tenant
-router.post('/', authenticate, authorize('superadmin'), logActivity({
+router.post('/', authenticate, authorize('superadmin', 'caretaker'), logActivity({
   action: 'create',
   entityType: 'tenant',
   getEntityName: (req) => `${req.body?.firstName || ''} ${req.body?.lastName || ''}`.trim() || req.body?.name
 }), async (req, res) => {
   try {
+    // Sanitize optional fields to handle sparse unique indexes
+    const fieldsToSanitize = ['email', 'phone', 'bankAccountNumber'];
+    fieldsToSanitize.forEach(field => {
+      if (req.body[field] === undefined || req.body[field] === null || (typeof req.body[field] === 'string' && req.body[field].trim() === '')) {
+        delete req.body[field];
+      } else if (typeof req.body[field] === 'string') {
+        req.body[field] = req.body[field].trim();
+      }
+    });
+
     const tenant = new Tenant(req.body);
     await tenant.save();
     const populatedTenant = await Tenant.findById(tenant._id)
@@ -94,7 +104,7 @@ router.post('/', authenticate, authorize('superadmin'), logActivity({
 });
 
 // Update tenant
-router.put('/:id', authenticate, authorize('superadmin'), logActivity({
+router.put('/:id', authenticate, authorize('superadmin', 'caretaker'), logActivity({
   action: 'update',
   entityType: 'tenant',
   getEntityName: async (req) => {
@@ -107,6 +117,16 @@ router.put('/:id', authenticate, authorize('superadmin'), logActivity({
   }
 }), async (req, res) => {
   try {
+    // Sanitize optional fields to handle sparse unique indexes
+    const fieldsToSanitize = ['email', 'phone', 'bankAccountNumber'];
+    fieldsToSanitize.forEach(field => {
+      if (req.body[field] === undefined || req.body[field] === null || (typeof req.body[field] === 'string' && req.body[field].trim() === '')) {
+        req.body[field] = undefined;
+      } else if (typeof req.body[field] === 'string') {
+        req.body[field] = req.body[field].trim();
+      }
+    });
+
     const tenant = await Tenant.findByIdAndUpdate(
       req.params.id,
       req.body,

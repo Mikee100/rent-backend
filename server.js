@@ -16,6 +16,7 @@ import equityBankRoutes from './routes/equityBank.js';
 import authRoutes from './routes/auth.js';
 import reportsRoutes from './routes/reports.js';
 import activityLogsRoutes from './routes/activityLogs.js';
+import { startAutomationJobs } from './services/automationScheduler.js';
 
 // Get current directory for ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -108,6 +109,11 @@ mongoose
     console.log('Connected to MongoDB');
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
+      
+      // Start automation jobs after server starts
+      startAutomationJobs().catch(error => {
+        console.error('Error starting automation jobs:', error);
+      });
     });
   })
   .catch((error) => {

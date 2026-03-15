@@ -333,5 +333,127 @@ router.get('/revenue-by-apartment', authenticate, async (req, res) => {
   }
 });
 
+// Monthly apartment units report (per-unit status for a given month)
+router.get('/monthly-apartment-units', authenticate, filterByApartment, async (req, res) => {
+  try {
+    const { apartmentId, month, year } = req.query;
+
+    if (!month || !year) {
+      return res.status(400).json({ message: 'Month and year are required' });
+    }
+
+    const monthNum = parseInt(month, 10);
+    const yearNum = parseInt(year, 10);
+
+    if (Number.isNaN(monthNum) || monthNum < 1 || monthNum > 12) {
+      return res.status(400).json({ message: 'Invalid month. Use 1-12.' });
+    }
+
+    if (Number.isNaN(yearNum)) {
+      return res.status(400).json({ message: 'Invalid year.' });
+    }
+
+    const monthStr = String(monthNum).padStart(2, '0');
+
+    // Determine target apartment
+    let targetApartmentId = apartmentId || null;
+
+    if (req.apartmentFilter && req.apartmentFilter.apartment) {
+      const caretakersApartmentId = req.apartmentFilter.apartment;
+      if (targetApartmentId && targetApartmentId !== caretakersApartmentId.toString()) {
+        return res.status(403).json({
+          message: 'Access denied. You can only view reports for your assigned apartment.'
+        });
+      }
+      targetApartmentId = caretakersApartmentId.toString();
+    }
+
+    if (!targetApartmentId) {
+      return res.status(400).json({ message: 'Apartment ID is required' });
+    }
+
+    const apartment = await Apartment.findById(targetApartmentId);
+    if (!apartment) {
+      return res.status(404).json({ message: 'Apartment not found' });
+    }
+
+    // Load all houses (units) for this apartment
+    const houses = await House.find({ apartment: targetApartmentId })
+      .populate('tenant', 'firstName lastName email phone')
+      .sort({ houseNumber: 1 });
+
+    const houseIds = houses.map((h) => h._id);
+
+    // Load all payments for these houses for the given month/year
+    const payments = await Payment.find({
+      house: { $in: houseIds },
+      month: monthStr,
+      year: yearNum
+    });
+
+    // Group payments by house
+    const paymentsByHouse = payments.reduce((acc, payment) => {
+      const key = payment.house.toString();
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(payment);
+      return acc;
+    }, {});
+
+    const units = houses.map((house) => {
+      const key = house._id.toString();
+      const housePayments = paymentsByHouse[key] || [];
+
+      let totalExpected = 0;
+      let totalPaid = 0;
+      let totalDeficit = 0;
+
+      if (housePayments.length > 0) {
+        housePayments.forEach((p) => {
+          const expected = typeof p.expectedAmount === 'number' ? p.expectedAmount : (p.amount || 0);
+          const paid = typeof p.paidAmount === 'number' ? p.paidAmount : (p.amount || 0);
+          const deficit = typeof p.deficit === 'number' ? p.deficit : Math.max(0, expected - paid);
+
+          totalExpected += expected;
+          totalPaid += paid;
+          totalDeficit += deficit;
+        });
+      } else {
+        // No payment records for this month: expected is at least one month of rent
+        totalExpected = house.rentAmount || 0;
+        totalPaid = 0;
+        totalDeficit = totalExpected;
+      }
+
+      const isCleared = totalDeficit <= 0.01;
+
+      return {
+        houseId: house._id,
+        houseNumber: house.houseNumber,
+        tenantName: house.tenant ? `${house.tenant.firstName} ${house.tenant.lastName}` : null,
+        rentAmount: house.rentAmount,
+        totalExpected,
+        totalPaid,
+        totalDeficit,
+        isCleared
+      };
+    });
+
+    res.json({
+      apartment: {
+        id: apartment._id,
+        name: apartment.name,
+        address: apartment.address
+      },
+      period: {
+        month: monthStr,
+        year: yearNum
+      },
+      units
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 export default router;
 

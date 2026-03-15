@@ -8,26 +8,24 @@ const tenantSchema = new mongoose.Schema({
   },
   lastName: {
     type: String,
-    required: true,
     trim: true
   },
   email: {
     type: String,
-    required: true,
-    unique: true,
     trim: true,
-    lowercase: true
+    lowercase: true,
+    sparse: true,
+    unique: true
   },
   phone: {
     type: String,
-    required: true,
     trim: true
   },
   bankAccountNumber: {
     type: String,
     trim: true,
     sparse: true,
-    index: true
+    unique: true
   },
   bankName: {
     type: String,
@@ -40,12 +38,10 @@ const tenantSchema = new mongoose.Schema({
     default: null
   },
   leaseStartDate: {
-    type: Date,
-    required: true
+    type: Date
   },
   leaseEndDate: {
-    type: Date,
-    required: true
+    type: Date
   },
   emergencyContact: {
     name: String,
