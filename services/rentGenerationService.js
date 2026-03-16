@@ -23,43 +23,42 @@ export async function generateMonthlyRent(options = {}) {
   const targetYear = year || new Date().getFullYear();
 
   try {
-    // Get all active tenants with houses
-    const tenants = await Tenant.find({
-      status: 'active',
-      house: { $ne: null }
-    }).populate('house');
+    // Get all occupied houses with their tenants and apartments
+    const houses = await (await import('../models/House.js')).default.find({
+      status: 'occupied',
+      tenant: { $ne: null }
+    }).populate('tenant').populate('apartment');
 
     const generatedPayments = [];
     const errors = [];
 
-    for (const tenant of tenants) {
-      if (!tenant.house) continue;
+    for (const house of houses) {
+      const tenant = house.tenant;
+      if (!tenant || tenant.status !== 'active') continue;
 
-      // Check if payment already exists for this month/year
+      // Check if payment already exists for this house/month/year
       const existingPayment = await Payment.findOne({
-        tenant: tenant._id,
-        house: tenant.house._id,
+        house: house._id,
         month: targetMonth,
         year: targetYear
       });
 
       if (existingPayment) {
-        errors.push(`Payment already exists for ${tenant.firstName} ${tenant.lastName} - ${targetMonth}/${targetYear}`);
+        errors.push(`Payment already exists for House ${house.houseNumber} (${tenant.firstName} ${tenant.lastName}) - ${targetMonth}/${targetYear}`);
         continue;
       }
 
       // Calculate due date (first of the month)
       const dueDate = new Date(targetYear, parseInt(targetMonth) - 1, 1);
 
-      // Get previous month's deficit to carry forward
+      // Get previous month's deficit to carry forward (specifically for this house)
       let carriedForward = 0;
       const prevMonth = parseInt(targetMonth) - 1;
       const prevYear = prevMonth === 0 ? targetYear - 1 : targetYear;
       const prevMonthStr = prevMonth === 0 ? '12' : String(prevMonth).padStart(2, '0');
 
       const prevPayment = await Payment.findOne({
-        tenant: tenant._id,
-        house: tenant.house._id,
+        house: house._id,
         month: prevMonthStr,
         year: prevYear
       }).sort({ createdAt: -1 });
@@ -68,8 +67,18 @@ export async function generateMonthlyRent(options = {}) {
         carriedForward = prevPayment.deficit;
       }
 
+      // Check if this house is a caretaker house (rent-free)
+      const isCaretakerHouse = house.apartment && 
+                               house.apartment.caretakerHouse && 
+                               house.apartment.caretakerHouse.toString() === house._id.toString();
+
+      if (isCaretakerHouse) {
+        continue; // Skip generating rent for caretaker units
+      }
+
       // Calculate expected amount (rent + carried forward deficit)
-      const expectedAmount = tenant.house.rentAmount + carriedForward;
+      const rentAmount = house.rentAmount;
+      const expectedAmount = rentAmount + carriedForward;
 
       // Calculate late fee if past due date + grace period
       const today = new Date();
@@ -86,7 +95,7 @@ export async function generateMonthlyRent(options = {}) {
 
       const payment = new Payment({
         tenant: tenant._id,
-        house: tenant.house._id,
+        house: house._id,
         amount: expectedAmount,
         expectedAmount: expectedAmount,
         paidAmount: 0,

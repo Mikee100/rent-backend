@@ -28,7 +28,7 @@ router.get('/', authenticate, filterByApartment, logActivity({
     
     const houses = await House.find(query)
       .populate('apartment', 'name address')
-      .populate('tenant', 'firstName lastName email phone')
+      .populate('tenant', 'firstName lastName email phone houses')
       .sort({ apartment: 1, houseNumber: 1 });
     res.json(houses);
   } catch (error) {
@@ -73,7 +73,7 @@ router.get('/apartment/:apartmentId', authenticate, filterByApartment, async (re
     }
 
     const houses = await House.find({ apartment: req.params.apartmentId })
-      .populate('tenant', 'firstName lastName email phone')
+      .populate('tenant', 'firstName lastName email phone houses')
       .sort({ houseNumber: 1 });
     res.json(houses);
   } catch (error) {
@@ -149,7 +149,7 @@ router.delete('/:id', authenticate, authorize('superadmin'), async (req, res) =>
     if (house.tenant) {
       const tenant = await Tenant.findById(house.tenant);
       if (tenant) {
-        tenant.house = null;
+        tenant.houses = tenant.houses.filter(h => h.toString() !== house._id.toString());
         await tenant.save();
       }
     }
@@ -218,14 +218,18 @@ router.post('/:id/assign-tenant', authenticate, async (req, res) => {
 
     house.tenant = tenantId;
     house.status = 'occupied';
-    tenant.house = house._id;
+    
+    // Add to tenant's houses array if not already there
+    if (!tenant.houses.includes(house._id)) {
+        tenant.houses.push(house._id);
+    }
     
     await house.save();
     await tenant.save();
 
     const updatedHouse = await House.findById(req.params.id)
       .populate('apartment', 'name address')
-      .populate('tenant', 'firstName lastName email phone');
+      .populate('tenant', 'firstName lastName email phone houses');
     res.json(updatedHouse);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -271,7 +275,7 @@ router.post('/:id/remove-tenant', authenticate, async (req, res) => {
     if (house.tenant) {
       const tenant = await Tenant.findById(house.tenant);
       if (tenant) {
-        tenant.house = null;
+        tenant.houses = tenant.houses.filter(h => h.toString() !== house._id.toString());
         await tenant.save();
       }
     }
@@ -282,7 +286,7 @@ router.post('/:id/remove-tenant', authenticate, async (req, res) => {
 
     const updatedHouse = await House.findById(req.params.id)
       .populate('apartment', 'name address')
-      .populate('tenant', 'firstName lastName email phone');
+      .populate('tenant', 'firstName lastName email phone houses');
     res.json(updatedHouse);
   } catch (error) {
     res.status(400).json({ message: error.message });

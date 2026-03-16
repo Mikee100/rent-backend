@@ -22,12 +22,12 @@ router.get('/', authenticate, filterByApartment, logActivity({
     if (req.apartmentFilter) {
       const houses = await House.find(req.apartmentFilter).select('_id');
       const houseIds = houses.map(h => h._id);
-      query = { house: { $in: houseIds } };
+      query = { houses: { $in: houseIds } };
     }
     
     const tenants = await Tenant.find(query)
       .populate({
-        path: 'house',
+        path: 'houses',
         populate: {
           path: 'apartment',
           select: 'name address'
@@ -45,7 +45,7 @@ router.get('/:id', authenticate, filterByApartment, async (req, res) => {
   try {
     const tenant = await Tenant.findById(req.params.id)
       .populate({
-        path: 'house',
+        path: 'houses',
         populate: {
           path: 'apartment',
           select: 'name address'
@@ -55,11 +55,14 @@ router.get('/:id', authenticate, filterByApartment, async (req, res) => {
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    // Check if caretaker can access this tenant
-    if (req.user.role === 'caretaker' && req.user.apartment && tenant.house) {
+    // Check if caretaker can access this tenant (must have at least one house in caretaker's apartment)
+    if (req.user.role === 'caretaker' && req.user.apartment && tenant.houses.length > 0) {
       const apartmentId = req.user.apartment._id || req.user.apartment;
-      const tenantApartmentId = tenant.house.apartment._id || tenant.house.apartment;
-      if (apartmentId.toString() !== tenantApartmentId.toString()) {
+      const hasAccess = tenant.houses.some(h => {
+          const tenantApartmentId = h.apartment._id || h.apartment;
+          return apartmentId.toString() === tenantApartmentId.toString();
+      });
+      if (!hasAccess) {
         return res.status(403).json({ message: 'Access denied. You can only view tenants in your assigned apartment.' });
       }
     }
@@ -91,7 +94,7 @@ router.post('/', authenticate, authorize('superadmin', 'caretaker'), logActivity
     await tenant.save();
     const populatedTenant = await Tenant.findById(tenant._id)
       .populate({
-        path: 'house',
+        path: 'houses',
         populate: {
           path: 'apartment',
           select: 'name address'
@@ -133,7 +136,7 @@ router.put('/:id', authenticate, authorize('superadmin', 'caretaker'), logActivi
       { new: true, runValidators: true }
     )
       .populate({
-        path: 'house',
+        path: 'houses',
         populate: {
           path: 'apartment',
           select: 'name address'
@@ -163,14 +166,12 @@ router.delete('/:id', authenticate, authorize('superadmin'), logActivity({
       return res.status(404).json({ message: 'Tenant not found' });
     }
 
-    // Remove tenant from house if assigned
-    if (tenant.house) {
-      const house = await House.findById(tenant.house);
-      if (house) {
-        house.tenant = null;
-        house.status = 'available';
-        await house.save();
-      }
+    // Remove tenant from ALL houses if deleting tenant
+    if (tenant.houses.length > 0) {
+      await House.updateMany(
+        { _id: { $in: tenant.houses } },
+        { $set: { tenant: null, status: 'available' } }
+      );
     }
 
     await Tenant.findByIdAndDelete(req.params.id);
@@ -200,7 +201,7 @@ router.post('/:id/documents', async (req, res) => {
 
     const populatedTenant = await Tenant.findById(tenant._id)
       .populate({
-        path: 'house',
+        path: 'houses',
         populate: {
           path: 'apartment',
           select: 'name address'
@@ -253,7 +254,7 @@ router.post('/:id/communication', async (req, res) => {
 
     const populatedTenant = await Tenant.findById(tenant._id)
       .populate({
-        path: 'house',
+        path: 'houses',
         populate: {
           path: 'apartment',
           select: 'name address'

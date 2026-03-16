@@ -30,6 +30,11 @@ const apartmentSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
     default: null
+  },
+  caretakerHouse: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'House',
+    default: null
   }
 }, {
   timestamps: true

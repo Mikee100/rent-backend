@@ -103,7 +103,7 @@ router.put('/:id', authenticate, logActivity({
         return res.status(403).json({ message: 'Access denied. You can only update your assigned apartment.' });
       }
       // Caretakers can only update certain fields
-      const allowedFields = ['name', 'address', 'description', 'manager'];
+      const allowedFields = ['name', 'address', 'description', 'manager', 'caretakerHouse'];
       Object.keys(req.body).forEach(key => {
         if (!allowedFields.includes(key)) {
           delete req.body[key];
@@ -148,6 +148,38 @@ router.delete('/:id', authenticate, authorize('superadmin'), logActivity({
       return res.status(404).json({ message: 'Apartment not found' });
     }
     res.json({ message: 'Apartment deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Apply global rent amount to all houses in an apartment
+router.post('/:id/apply-global-rent', authenticate, authorize('superadmin'), logActivity({
+  action: 'update',
+  entityType: 'apartment',
+  description: (req) => `Applied global rent KSh ${req.body.rentAmount} to all units`
+}), async (req, res) => {
+  try {
+    const { rentAmount } = req.body;
+    if (rentAmount === undefined || isNaN(rentAmount)) {
+      return res.status(400).json({ message: 'Valid rent amount is required' });
+    }
+
+    const apartment = await Apartment.findById(req.params.id);
+    if (!apartment) {
+      return res.status(404).json({ message: 'Apartment not found' });
+    }
+
+    // Update all houses in this apartment
+    const result = await House.updateMany(
+      { apartment: req.params.id },
+      { $set: { rentAmount: parseFloat(rentAmount) } }
+    );
+
+    res.json({ 
+      message: `Successfully updated ${result.modifiedCount} houses with rent KSh ${rentAmount}`,
+      count: result.modifiedCount
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

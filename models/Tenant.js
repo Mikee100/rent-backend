@@ -32,11 +32,10 @@ const tenantSchema = new mongoose.Schema({
     trim: true,
     default: 'Equity'
   },
-  house: {
+  houses: [{
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'House',
-    default: null
-  },
+    ref: 'House'
+  }],
   leaseStartDate: {
     type: Date
   },

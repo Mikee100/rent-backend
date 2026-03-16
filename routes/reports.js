@@ -43,6 +43,12 @@ router.get('/income-statement', authenticate, filterByApartment, async (req, res
       }
     }
 
+    // Get caretaker house IDs to exclude
+    const apartments = await Apartment.find({});
+    const caretakerHouseIds = new Set(
+      apartments.filter(a => a.caretakerHouse).map(a => a.caretakerHouse.toString())
+    );
+
     // Get revenue (paid payments)
     const payments = await Payment.find({ ...paymentQuery, status: { $in: ['paid', 'partial'] } })
       .populate('house', 'houseNumber')
@@ -51,8 +57,13 @@ router.get('/income-statement', authenticate, filterByApartment, async (req, res
         populate: { path: 'apartment', select: 'name' }
       });
     
-    const revenue = payments.reduce((sum, p) => sum + (p.paidAmount || p.amount || 0), 0);
-    const lateFees = payments.reduce((sum, p) => sum + (p.lateFee || 0), 0);
+    // Filter out caretaker payments
+    const validPayments = payments.filter(p => !p.house || !caretakerHouseIds.has(p.house._id.toString()));
+    
+    const revenue = validPayments.reduce((sum, p) => sum + (p.paidAmount || p.amount || 0), 0);
+    const lateFees = validPayments.reduce((sum, p) => sum + (p.lateFee || 0), 0);
+    const advanceCollections = validPayments.reduce((sum, p) => sum + (p.isAdvance ? (p.paidAmount || p.amount || 0) : 0), 0);
+    const overpayments = validPayments.reduce((sum, p) => sum + (p.overpayment || 0), 0);
     
     // Get expenses
     const expenses = await Expense.find(expenseQuery)
@@ -77,6 +88,8 @@ router.get('/income-statement', authenticate, filterByApartment, async (req, res
       revenue: {
         rent: revenue,
         lateFees: lateFees,
+        advanceCollections: advanceCollections,
+        overpayments: overpayments,
         total: revenue + lateFees
       },
       expenses: {
@@ -92,7 +105,7 @@ router.get('/income-statement', authenticate, filterByApartment, async (req, res
         }))
       },
       netIncome: netIncome,
-      paymentCount: payments.length,
+      paymentCount: validPayments.length,
       expenseCount: expenses.length
     });
   } catch (error) {
@@ -131,9 +144,9 @@ router.get('/tenant-ledger/:tenantId', authenticate, filterByApartment, async (r
       .sort({ paymentDate: -1 });
     
     const tenant = await Tenant.findById(tenantId)
-      .populate('house', 'houseNumber')
+      .populate('houses', 'houseNumber')
       .populate({
-        path: 'house',
+        path: 'houses',
         populate: { path: 'apartment', select: 'name' }
       });
     
@@ -141,6 +154,7 @@ router.get('/tenant-ledger/:tenantId', authenticate, filterByApartment, async (r
     const totalExpected = payments.reduce((sum, p) => sum + (p.expectedAmount || p.amount || 0), 0);
     const totalDeficit = payments.reduce((sum, p) => sum + (p.deficit || 0), 0);
     const totalLateFees = payments.reduce((sum, p) => sum + (p.lateFee || 0), 0);
+    const totalOverpaid = payments.reduce((sum, p) => sum + (p.overpayment || 0), 0);
     
     // Calculate running balance
     let runningBalance = 0;
@@ -160,8 +174,8 @@ router.get('/tenant-ledger/:tenantId', authenticate, filterByApartment, async (r
         name: tenant ? `${tenant.firstName} ${tenant.lastName}` : 'N/A',
         email: tenant?.email,
         phone: tenant?.phone,
-        house: tenant?.house?.houseNumber,
-        apartment: tenant?.house?.apartment?.name
+        house: tenant?.houses?.map(h => h.houseNumber).join(', '),
+        apartment: tenant?.houses?.[0]?.apartment?.name
       },
       period: {
         startDate: startDate || null,
@@ -172,6 +186,7 @@ router.get('/tenant-ledger/:tenantId', authenticate, filterByApartment, async (r
         totalExpected: totalExpected,
         totalDeficit: totalDeficit,
         totalLateFees: totalLateFees,
+        totalOverpaid: totalOverpaid,
         currentBalance: runningBalance,
         paymentCount: payments.length
       },
@@ -193,7 +208,13 @@ router.get('/outstanding-balances', authenticate, filterByApartment, async (req,
       const houseIds = houses.map(h => h._id);
       paymentQuery.house = { $in: houseIds };
     }
-    
+
+    // Get all apartments to find caretaker houses
+    const apartments = await (await import('../models/Apartment.js')).default.find({});
+    const caretakerHouseIds = new Set(
+      apartments.filter(a => a.caretakerHouse).map(a => a.caretakerHouse.toString())
+    );
+
     // Get all tenants with payments
     const payments = await Payment.find(paymentQuery)
       .populate('tenant', 'firstName lastName email phone')
@@ -203,10 +224,15 @@ router.get('/outstanding-balances', authenticate, filterByApartment, async (req,
         populate: { path: 'apartment', select: 'name' }
       });
     
-    // Group by tenant
+    // Group by tenant and house/month to prevent counting expectedAmount twice
     const tenantBalances = payments.reduce((acc, payment) => {
       const tenantId = payment.tenant?._id?.toString();
       if (!tenantId) return acc;
+      
+      const houseId = payment.house?._id?.toString() || 'unknown';
+      if (caretakerHouseIds.has(houseId)) return acc; // Skip caretaker houses
+      const monthYear = `${payment.month}-${payment.year}`;
+      const periodKey = `${tenantId}-${houseId}-${monthYear}`;
       
       if (!acc[tenantId]) {
         acc[tenantId] = {
@@ -215,7 +241,8 @@ router.get('/outstanding-balances', authenticate, filterByApartment, async (req,
           totalPaid: 0,
           totalDeficit: 0,
           totalLateFees: 0,
-          payments: []
+          payments: [],
+          processedPeriods: new Set()
         };
       }
       
@@ -224,7 +251,12 @@ router.get('/outstanding-balances', authenticate, filterByApartment, async (req,
       const deficit = payment.deficit || 0;
       const lateFee = payment.lateFee || 0;
       
-      acc[tenantId].totalExpected += expected;
+      // Only count expectedAmount once per house/month/tenant period
+      if (!acc[tenantId].processedPeriods.has(periodKey)) {
+        acc[tenantId].totalExpected += expected;
+        acc[tenantId].processedPeriods.add(periodKey);
+      }
+      
       acc[tenantId].totalPaid += paid;
       acc[tenantId].totalDeficit += deficit;
       acc[tenantId].totalLateFees += lateFee;
@@ -246,9 +278,25 @@ router.get('/outstanding-balances', authenticate, filterByApartment, async (req,
     
     const totalOutstanding = balances.reduce((sum, t) => sum + t.currentBalance, 0);
     
+    // Calculate totals by apartment
+    const byApartment = balances.reduce((acc, b) => {
+      const apartmentName = b.apartment?.name || 'Unknown';
+      if (!acc[apartmentName]) {
+        acc[apartmentName] = {
+          apartmentName,
+          totalOutstanding: 0,
+          tenantCount: 0
+        };
+      }
+      acc[apartmentName].totalOutstanding += b.currentBalance;
+      acc[apartmentName].tenantCount += 1;
+      return acc;
+    }, {});
+
     res.json({
       totalOutstanding: totalOutstanding,
       tenantCount: balances.length,
+      byApartment: Object.values(byApartment).sort((a, b) => b.totalOutstanding - a.totalOutstanding),
       balances: balances
     });
   } catch (error) {
@@ -283,12 +331,24 @@ router.get('/revenue-by-apartment', authenticate, async (req, res) => {
         populate: { path: 'apartment', select: 'name address' }
       });
     
+    // Get caretaker house IDs to exclude
+    const apartments = await Apartment.find({});
+    const caretakerHouseIds = new Set(
+      apartments.filter(a => a.caretakerHouse).map(a => a.caretakerHouse.toString())
+    );
+
     // Group by apartment
     const revenueByApartment = payments.reduce((acc, payment) => {
       const apartmentId = payment.house?.apartment?._id?.toString();
       const apartmentName = payment.house?.apartment?.name || 'Unknown';
       
+      // Get the house ID - handle both populated and unpopulated cases for safety
+      const houseId = (payment.house?._id || payment.house)?.toString();
+      
       if (!apartmentId) return acc;
+      
+      // Skip caretaker houses from both revenue AND counts
+      if (houseId && caretakerHouseIds.has(houseId)) return acc;
       
       if (!acc[apartmentId]) {
         acc[apartmentId] = {
@@ -304,6 +364,7 @@ router.get('/revenue-by-apartment', authenticate, async (req, res) => {
       acc[apartmentId].revenue += (payment.paidAmount || payment.amount || 0);
       acc[apartmentId].lateFees += (payment.lateFee || 0);
       acc[apartmentId].paymentCount += 1;
+      
       if (payment.tenant) {
         acc[apartmentId].tenantCount.add(payment.tenant.toString());
       }
@@ -402,41 +463,55 @@ router.get('/monthly-apartment-units', authenticate, filterByApartment, async (r
     const units = houses.map((house) => {
       const key = house._id.toString();
       const housePayments = paymentsByHouse[key] || [];
+      const isCaretaker = apartment.caretakerHouse && apartment.caretakerHouse.toString() === key;
 
       let totalExpected = 0;
       let totalPaid = 0;
       let totalDeficit = 0;
 
-      if (housePayments.length > 0) {
+      if (isCaretaker) {
+        totalExpected = 0;
+        totalPaid = 0;
+        totalDeficit = 0;
+      } else if (housePayments.length > 0) {
+        totalExpected = housePayments[0].expectedAmount || housePayments[0].amount || 0;
         housePayments.forEach((p) => {
-          const expected = typeof p.expectedAmount === 'number' ? p.expectedAmount : (p.amount || 0);
           const paid = typeof p.paidAmount === 'number' ? p.paidAmount : (p.amount || 0);
-          const deficit = typeof p.deficit === 'number' ? p.deficit : Math.max(0, expected - paid);
-
-          totalExpected += expected;
           totalPaid += paid;
-          totalDeficit += deficit;
         });
+        totalDeficit = Math.max(0, totalExpected - totalPaid);
       } else {
-        // No payment records for this month: expected is at least one month of rent
         totalExpected = house.rentAmount || 0;
         totalPaid = 0;
         totalDeficit = totalExpected;
       }
 
-      const isCleared = totalDeficit <= 0.01;
+      const unitAdvance = housePayments.reduce((sum, p) => sum + (p.isAdvance ? (p.paidAmount || p.amount || 0) : 0), 0);
+      const unitOverpayment = housePayments.reduce((sum, p) => sum + (p.overpayment || 0), 0);
 
       return {
         houseId: house._id,
         houseNumber: house.houseNumber,
         tenantName: house.tenant ? `${house.tenant.firstName} ${house.tenant.lastName}` : null,
-        rentAmount: house.rentAmount,
+        rentAmount: isCaretaker ? 0 : house.rentAmount,
         totalExpected,
         totalPaid,
         totalDeficit,
-        isCleared
+        isCleared: totalDeficit <= 0,
+        isCaretaker,
+        totalAdvance: unitAdvance,
+        totalOverpayment: unitOverpayment
       };
     });
+
+    const summary = units.filter(u => !u.isCaretaker).reduce((acc, unit) => {
+      acc.totalExpected += unit.totalExpected;
+      acc.totalPaid += unit.totalPaid;
+      acc.totalDeficit += unit.totalDeficit;
+      acc.totalAdvance += (unit.totalAdvance || 0);
+      acc.totalOverpayment += (unit.totalOverpayment || 0);
+      return acc;
+    }, { totalExpected: 0, totalPaid: 0, totalDeficit: 0, totalAdvance: 0, totalOverpayment: 0 });
 
     res.json({
       apartment: {
@@ -448,8 +523,90 @@ router.get('/monthly-apartment-units', authenticate, filterByApartment, async (r
         month: monthStr,
         year: yearNum
       },
+      summary,
       units
     });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Apartment Financial History (Historical overview of rent collection)
+router.get('/apartment-financial-history/:apartmentId', authenticate, filterByApartment, async (req, res) => {
+  try {
+    const { apartmentId } = req.params;
+    
+    // Check if caretaker can access this apartment
+    if (req.user.role === 'caretaker' && req.user.apartment) {
+      const userAptId = req.user.apartment._id || req.user.apartment;
+      if (apartmentId !== userAptId.toString()) {
+        return res.status(403).json({ message: 'Access denied. You can only view your assigned apartment.' });
+      }
+    }
+
+    const apartment = await Apartment.findById(apartmentId);
+    if (!apartment) {
+      return res.status(404).json({ message: 'Apartment not found' });
+    }
+
+    const caretakerHouseId = apartment.caretakerHouse ? apartment.caretakerHouse.toString() : null;
+
+    // Get all houses for this apartment to match payments easily
+    const houses = await House.find({ apartment: apartmentId }).select('_id houseNumber');
+    const houseIds = houses.map(h => h._id);
+
+    // Get all payments for these houses
+    const payments = await Payment.find({
+      house: { $in: houseIds }
+    }).sort({ year: -1, month: -1 });
+
+    // Group by month and year
+    const history = payments.reduce((acc, p) => {
+      const houseId = p.house.toString();
+      
+      // EXCLUDE CARETAKER
+      if (caretakerHouseId && houseId === caretakerHouseId) return acc;
+
+      const key = `${p.year}-${p.month}`;
+      if (!acc[key]) {
+        acc[key] = {
+          month: p.month,
+          year: p.year,
+          totalExpected: 0,
+          totalPaid: 0,
+          deficit: 0,
+          paymentCount: 0
+        };
+      }
+
+      // We only want to count expectedAmount once per house/month
+      // Using a temporary set to track processed houses per month
+      if (!acc[key].processedHouses) acc[key].processedHouses = new Set();
+      
+      if (!acc[key].processedHouses.has(houseId)) {
+        acc[key].totalExpected += (p.expectedAmount || p.amount || 0);
+        acc[key].processedHouses.add(houseId);
+      }
+
+      acc[key].totalPaid += (p.paidAmount || p.amount || 0);
+      acc[key].deficit += (p.deficit || 0);
+      acc[key].paymentCount += 1;
+
+      return acc;
+    }, {});
+
+    // Convert to array and clean up temporary sets
+    const sortedHistory = Object.values(history)
+      .map(item => {
+        delete item.processedHouses;
+        return item;
+      })
+      .sort((a, b) => {
+        if (a.year !== b.year) return b.year - a.year;
+        return parseInt(b.month) - parseInt(a.month);
+      });
+
+    res.json(sortedHistory);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

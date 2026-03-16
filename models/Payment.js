@@ -104,6 +104,15 @@ const paymentSchema = new mongoose.Schema({
     trim: true,
     unique: true,
     sparse: true
+  },
+  isAdvance: {
+    type: Boolean,
+    default: false
+  },
+  overpayment: {
+    type: Number,
+    default: 0,
+    min: 0
   }
 }, {
   timestamps: true

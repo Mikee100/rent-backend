@@ -2,6 +2,7 @@ import express from 'express';
 import Payment from '../models/Payment.js';
 import Tenant from '../models/Tenant.js';
 import House from '../models/House.js';
+import Apartment from '../models/Apartment.js';
 import { authenticate, filterByApartment, authorize } from '../middleware/auth.js';
 import { logActivity } from '../middleware/activityLogger.js';
 import { generateMonthlyRent } from '../services/rentGenerationService.js';
@@ -158,82 +159,189 @@ router.get('/apartment/:apartmentId', authenticate, filterByApartment, async (re
 // Create payment
 router.post('/', async (req, res) => {
   try {
+    const { months, amount: totalAmount, ...commonData } = req.body;
+    
+    // Normalize to an array of months if provided, otherwise use single month/year
+    const monthList = months && Array.isArray(months) && months.length > 0 
+      ? months 
+      : [{ month: commonData.month, year: commonData.year }];
+    
     // If houseNumber is provided, find the house
-    if (req.body.houseNumber && !req.body.house) {
-      const house = await House.findOne({ houseNumber: req.body.houseNumber });
+    let houseId = commonData.house;
+    let tenantId = commonData.tenant;
+
+    if (commonData.houseNumber && !houseId) {
+      const house = await House.findOne({ houseNumber: commonData.houseNumber });
       if (!house) {
-        return res.status(404).json({ message: `House with number ${req.body.houseNumber} not found` });
+        return res.status(404).json({ message: `House with number ${commonData.houseNumber} not found` });
       }
-      req.body.house = house._id;
+      houseId = house._id;
       
       // If tenant is not provided but house has a tenant, use it
-      if (!req.body.tenant && house.tenant) {
-        req.body.tenant = house.tenant;
+      if (!tenantId && house.tenant) {
+        tenantId = house.tenant;
       }
-    }
-
-    // Generate receipt number if not provided
-    if (!req.body.receiptNumber) {
-      const count = await Payment.countDocuments();
-      req.body.receiptNumber = `RCP-${new Date().getFullYear()}-${String(count + 1).padStart(6, '0')}`;
     }
 
     // Get house to determine rent amount
     let house = null;
-    if (req.body.house) {
-      house = await House.findById(req.body.house);
+    if (houseId) {
+      house = await House.findById(houseId);
     }
 
     if (!house) {
       return res.status(400).json({ message: 'House is required' });
     }
 
-    // Calculate expected amount (rent + any carried forward deficit)
-    let carriedForward = 0;
-    if (req.body.tenant && req.body.month && req.body.year) {
-      // Find previous month's payment to get deficit
-      const prevMonth = parseInt(req.body.month) - 1;
-      const prevYear = prevMonth === 0 ? parseInt(req.body.year) - 1 : parseInt(req.body.year);
-      const prevMonthStr = prevMonth === 0 ? '12' : String(prevMonth).padStart(2, '0');
-      
-      const prevPayment = await Payment.findOne({
-        tenant: req.body.tenant,
-        house: house._id,
-        month: prevMonthStr,
-        year: prevYear
-      }).sort({ createdAt: -1 });
+    const createdPayments = [];
+    let remainingAmount = totalAmount || 0;
+    
+    // Sort months to ensure correct deficit carry-forward logic
+    const sortedMonths = [...monthList].sort((a, b) => {
+      const yearA = parseInt(a.year);
+      const yearB = parseInt(b.year);
+      if (yearA !== yearB) return yearA - yearB;
+      return parseInt(a.month) - parseInt(b.month);
+    });
 
-      if (prevPayment && prevPayment.deficit > 0) {
-        carriedForward = prevPayment.deficit;
+    const baseCount = await Payment.countDocuments();
+
+    const currentMonth = String(new Date().getMonth() + 1).padStart(2, '0');
+    const currentYear = new Date().getFullYear();
+
+    for (let i = 0; i < sortedMonths.length; i++) {
+      const { month, year } = sortedMonths[i];
+      const isAdvance = (parseInt(year) > currentYear) || (parseInt(year) === currentYear && parseInt(month) > parseInt(currentMonth));
+      
+      // Calculate expected amount (rent + any carried forward deficit)
+      let carriedForward = 0;
+      if (tenantId && month && year) {
+        // Find previous month's payment to get deficit
+        const prevMonth = parseInt(month) - 1;
+        const prevYear = prevMonth === 0 ? parseInt(year) - 1 : parseInt(year);
+        const prevMonthStr = prevMonth === 0 ? '12' : String(prevMonth).padStart(2, '0');
+        
+        const prevPayment = await Payment.findOne({
+          tenant: tenantId,
+          house: house._id,
+          month: prevMonthStr,
+          year: prevYear
+        }).sort({ createdAt: -1 });
+
+        if (prevPayment && prevPayment.deficit > 0) {
+          carriedForward = prevPayment.deficit;
+        }
+      }
+
+      const rentAmount = (house.apartment && 
+                          house.apartment.caretakerHouse && 
+                          house.apartment.caretakerHouse.toString() === house._id.toString()) ? 0 : house.rentAmount;
+      const baseExpectedAmount = rentAmount + carriedForward;
+      
+      // Check if a payment record already exists for this month/year (e.g. auto-generated or previous partial)
+      let existingPaymentRecord = await Payment.findOne({
+        house: houseId,
+        month,
+        year: parseInt(year)
+      });
+
+      let paidAmountForThisMonth = 0;
+      let overpaymentForThisMonth = 0;
+      let finalExpectedAmount = baseExpectedAmount;
+
+      if (sortedMonths.length === 1) {
+        paidAmountForThisMonth = remainingAmount;
+        // If single month and amount > expected, the remainder is overpayment
+        if (remainingAmount > baseExpectedAmount) {
+            overpaymentForThisMonth = remainingAmount - baseExpectedAmount;
+        }
+      } else {
+        paidAmountForThisMonth = Math.min(remainingAmount, baseExpectedAmount);
+        remainingAmount -= paidAmountForThisMonth;
+        
+        // If it's the last month and we still have money left, it's an overpayment
+        if (i === sortedMonths.length - 1 && remainingAmount > 0) {
+          overpaymentForThisMonth = remainingAmount;
+          remainingAmount = 0;
+        }
+      }
+
+      const totalPaidThisMonth = paidAmountForThisMonth + overpaymentForThisMonth;
+      const paymentNotes = isAdvance ? `Advance payment for ${month}/${year}.` : `Payment for ${month}/${year}.`;
+      const overpaymentNote = overpaymentForThisMonth > 0 ? ` (Includes overpayment of ${overpaymentForThisMonth})` : "";
+
+      if (existingPaymentRecord) {
+        // Update existing record
+        const newPaidTotal = (existingPaymentRecord.paidAmount || 0) + paidAmountForThisMonth;
+        const newOverpaymentTotal = (existingPaymentRecord.overpayment || 0) + overpaymentForThisMonth;
+        finalExpectedAmount = existingPaymentRecord.expectedAmount || baseExpectedAmount;
+        const newDeficit = Math.max(0, finalExpectedAmount - newPaidTotal);
+        
+        let status = 'pending';
+        if (newPaidTotal >= finalExpectedAmount) {
+          status = 'paid';
+        } else if (newPaidTotal > 0) {
+          status = 'partial';
+        }
+
+        existingPaymentRecord.paidAmount = newPaidTotal;
+        existingPaymentRecord.overpayment = newOverpaymentTotal;
+        existingPaymentRecord.amount = newPaidTotal + newOverpaymentTotal; 
+        existingPaymentRecord.deficit = newDeficit;
+        existingPaymentRecord.status = status;
+        existingPaymentRecord.isAdvance = isAdvance;
+        existingPaymentRecord.paymentDate = commonData.paymentDate || new Date();
+        existingPaymentRecord.paymentMethod = commonData.paymentMethod || existingPaymentRecord.paymentMethod;
+        existingPaymentRecord.notes = (existingPaymentRecord.notes ? existingPaymentRecord.notes + "\n" : "") + 
+                                     (commonData.notes || `${paymentNotes}${overpaymentNote}`);
+        
+        if (commonData.transactionId) existingPaymentRecord.transactionId = commonData.transactionId;
+        if (commonData.referenceNumber) existingPaymentRecord.referenceNumber = commonData.referenceNumber;
+        
+        await existingPaymentRecord.save();
+        createdPayments.push(existingPaymentRecord._id);
+      } else {
+        // Create new record
+        const deficit = Math.max(0, baseExpectedAmount - paidAmountForThisMonth);
+        let status = 'pending';
+        if (paidAmountForThisMonth >= baseExpectedAmount) {
+          status = 'paid';
+        } else if (paidAmountForThisMonth > 0) {
+          status = 'partial';
+        }
+
+        let receiptNumber = commonData.receiptNumber;
+        if (sortedMonths.length > 1) {
+          receiptNumber = receiptNumber ? `${receiptNumber}-${i + 1}` : `RCP-${new Date().getFullYear()}-${String(baseCount + i + 1).padStart(6, '0')}`;
+        } else if (!receiptNumber) {
+          receiptNumber = `RCP-${new Date().getFullYear()}-${String(baseCount + 1).padStart(6, '0')}`;
+        }
+
+        const paymentData = {
+          ...commonData,
+          tenant: tenantId,
+          house: houseId,
+          month,
+          year: parseInt(year),
+          expectedAmount: baseExpectedAmount,
+          paidAmount: paidAmountForThisMonth,
+          overpayment: overpaymentForThisMonth,
+          amount: totalPaidThisMonth,
+          deficit: deficit,
+          carriedForward: carriedForward,
+          status: status,
+          isAdvance: isAdvance,
+          receiptNumber: receiptNumber,
+          notes: (commonData.notes || `${paymentNotes}${overpaymentNote}`)
+        };
+
+        const payment = new Payment(paymentData);
+        await payment.save();
+        createdPayments.push(payment._id);
       }
     }
 
-    const expectedAmount = house.rentAmount + carriedForward;
-    const paidAmount = req.body.amount || 0;
-    const deficit = Math.max(0, expectedAmount - paidAmount);
-
-    // Set payment status
-    let status = 'pending';
-    if (paidAmount >= expectedAmount) {
-      status = 'paid';
-    } else if (paidAmount > 0) {
-      status = 'partial';
-    }
-
-    // Create payment with calculated values
-    const paymentData = {
-      ...req.body,
-      expectedAmount: expectedAmount,
-      paidAmount: paidAmount,
-      deficit: deficit,
-      carriedForward: carriedForward,
-      status: status
-    };
-
-    const payment = new Payment(paymentData);
-    await payment.save();
-
-    const populatedPayment = await Payment.findById(payment._id)
+    const populatedPayments = await Payment.find({ _id: { $in: createdPayments } })
       .populate('tenant', 'firstName lastName email')
       .populate({
         path: 'house',
@@ -242,7 +350,8 @@ router.post('/', async (req, res) => {
           select: 'name address'
         }
       });
-    res.status(201).json(populatedPayment);
+
+    res.status(201).json(months ? populatedPayments : populatedPayments[0]);
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -378,82 +487,20 @@ router.post('/mpesa-confirmation', async (req, res) => {
     // Process payment asynchronously
     if (BillRefNumber && TransAmount && TransID) {
       try {
-        // Find house by house number (account number)
-        const house = await House.findOne({ houseNumber: BillRefNumber.trim() })
-          .populate('apartment')
-          .populate('tenant');
-
-        if (!house) {
-          console.error(`House ${BillRefNumber} not found for M-Pesa payment ${TransID}`);
-          return;
-        }
-
-        if (!house.tenant) {
-          console.error(`House ${BillRefNumber} has no tenant for M-Pesa payment ${TransID}`);
-          return;
-        }
-
-        // Check if payment already exists
-        const existingPayment = await Payment.findOne({ transactionId: TransID });
-        if (existingPayment) {
-          console.log(`Payment ${TransID} already exists`);
-          return;
-        }
-
-        // Determine month and year
         const transDate = new Date(TransTime);
-        const month = String(transDate.getMonth() + 1).padStart(2, '0');
-        const year = transDate.getFullYear();
-
-        // Check for duplicate payment for this month/year
-        const duplicatePayment = await Payment.findOne({
-          house: house._id,
-          tenant: house.tenant._id,
-          month,
-          year,
-          status: 'paid'
-        });
-
-        if (duplicatePayment) {
-          console.log(`Payment already exists for house ${BillRefNumber} for ${month}/${year}`);
-          return;
-        }
-
-        // Calculate due date
-        const dueDate = new Date(year, parseInt(month) - 1, 1);
-
-        // Determine status
-        let status = 'paid';
-        if (parseFloat(TransAmount) < house.rentAmount) {
-          status = 'partial';
-        }
-
-        // Generate receipt number
-        const count = await Payment.countDocuments();
-        const receiptNumber = `RCP-${year}-${String(count + 1).padStart(6, '0')}`;
-
-        // Create payment
-        const payment = new Payment({
-          tenant: house.tenant._id,
-          house: house._id,
-          amount: parseFloat(TransAmount),
-          paymentDate: transDate,
-          dueDate: dueDate,
-          paymentMethod: 'mobile_money',
-          status: status,
-          month: month,
-          year: year,
+        const amount = parseFloat(TransAmount);
+        
+        await processMultiMonthPayment({
+          houseNumber: BillRefNumber.trim(),
+          amount,
           transactionId: TransID,
-          referenceNumber: TransID,
-          receivedFrom: MSISDN || `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim() || house.tenant.firstName + ' ' + house.tenant.lastName,
-          houseNumber: BillRefNumber,
+          paymentDate: transDate,
+          paymentMethod: 'mobile_money',
           paymentSource: 'paybill',
-          receiptNumber: receiptNumber,
-          notes: `M-Pesa paybill payment received. Transaction ID: ${TransID}`
+          receivedFrom: MSISDN || `${FirstName || ''} ${MiddleName || ''} ${LastName || ''}`.trim(),
+          notes: `M-Pesa paybill payment received. TransID: ${TransID}`
         });
 
-        await payment.save();
-        console.log(`✅ M-Pesa payment recorded: ${receiptNumber} for house ${BillRefNumber}, amount ${TransAmount}`);
       } catch (error) {
         console.error('Error processing M-Pesa payment:', error);
       }
@@ -467,6 +514,143 @@ router.post('/mpesa-confirmation', async (req, res) => {
     });
   }
 });
+
+// Helper function to process multi-month payments (used by M-Pesa and Paybill)
+async function processMultiMonthPayment({ houseNumber, amount, transactionId, paymentDate, paymentMethod, paymentSource, receivedFrom, notes }) {
+  const house = await House.findOne({ houseNumber }).populate('tenant');
+  if (!house || !house.tenant) {
+    throw new Error(`House ${houseNumber} not found or has no tenant`);
+  }
+
+  const existingPayment = await Payment.findOne({ transactionId });
+  if (existingPayment) {
+    console.log(`Payment ${transactionId} already exists`);
+    return;
+  }
+
+  let remainingAmount = amount;
+  const currentMonth = String(new Date().getMonth() + 1).padStart(2, '0');
+  const currentYear = new Date().getFullYear();
+  
+  let iterMonth = parseInt(currentMonth);
+  let iterYear = currentYear;
+  
+  const processedPayments = [];
+  const baseCount = await Payment.countDocuments();
+
+  // Try to allocate to current and future months (up to 12 months ahead)
+  for (let i = 0; i < 12 && remainingAmount > 0; i++) {
+    const monthStr = String(iterMonth).padStart(2, '0');
+    const isAdvance = (iterYear > currentYear) || (iterYear === currentYear && iterMonth > parseInt(currentMonth));
+    
+    let existingRecord = await Payment.findOne({
+      house: house._id,
+      month: monthStr,
+      year: iterYear
+    });
+
+    let expectedAmount = house.rentAmount;
+    let carriedForward = 0;
+    
+    // If no existing record, try to see if there was a deficit from previous
+    if (!existingRecord) {
+        const prevMonthVal = iterMonth - 1;
+        const prevYearVal = prevMonthVal === 0 ? iterYear - 1 : iterYear;
+        const prevMonthStr = prevMonthVal === 0 ? '12' : String(prevMonthVal).padStart(2, '0');
+        
+        const prevPayment = await Payment.findOne({
+            house: house._id,
+            month: prevMonthStr,
+            year: prevYearVal
+        }).sort({ createdAt: -1 });
+        
+        if (prevPayment && prevPayment.deficit > 0) {
+            carriedForward = prevPayment.deficit;
+        }
+    } else {
+        expectedAmount = existingRecord.expectedAmount || house.rentAmount;
+        carriedForward = existingRecord.carriedForward || 0;
+    }
+
+    const totalNeeded = Math.max(0, expectedAmount - (existingRecord?.paidAmount || 0));
+    
+    if (totalNeeded <= 0 && isAdvance && i > 0) {
+        // Already paid for this month, move to next
+        iterMonth++;
+        if (iterMonth > 12) {
+            iterMonth = 1;
+            iterYear++;
+        }
+        continue;
+    }
+
+    let paidForThisMonth = Math.min(remainingAmount, totalNeeded);
+    let overpaymentForThisMonth = 0;
+
+    // If it's the 12th month of checking or we are deep into the future, put all remainder as overpayment
+    if (i === 11) {
+        overpaymentForThisMonth = remainingAmount;
+    } else {
+        remainingAmount -= paidForThisMonth;
+    }
+
+    if (existingRecord) {
+        existingRecord.paidAmount = (existingRecord.paidAmount || 0) + paidForThisMonth;
+        existingRecord.overpayment = (existingRecord.overpayment || 0) + overpaymentForThisMonth;
+        existingRecord.amount = (existingRecord.paidAmount) + (existingRecord.overpayment);
+        existingRecord.deficit = Math.max(0, existingRecord.expectedAmount - existingRecord.paidAmount);
+        existingRecord.status = existingRecord.paidAmount >= existingRecord.expectedAmount ? 'paid' : (existingRecord.paidAmount > 0 ? 'partial' : 'pending');
+        existingRecord.paymentDate = paymentDate;
+        existingRecord.paymentMethod = paymentMethod;
+        existingRecord.transactionId = transactionId;
+        existingRecord.paymentSource = paymentSource;
+        existingRecord.isAdvance = isAdvance;
+        existingRecord.notes = (existingRecord.notes ? existingRecord.notes + "\n" : "") + 
+                              `${notes}. allocated ${paidForThisMonth}${overpaymentForThisMonth > 0 ? ` + ${overpaymentForThisMonth} overpayment` : ''}`;
+        
+        await existingRecord.save();
+        processedPayments.push(existingRecord);
+    } else {
+        const receiptNumber = `RCP-${iterYear}-${String(baseCount + processedPayments.length + 1).padStart(6, '0')}`;
+        const newPayment = new Payment({
+            tenant: house.tenant._id,
+            house: house._id,
+            amount: paidForThisMonth + overpaymentForThisMonth,
+            paidAmount: paidForThisMonth,
+            overpayment: overpaymentForThisMonth,
+            expectedAmount: expectedAmount,
+            deficit: Math.max(0, expectedAmount - paidForThisMonth),
+            carriedForward: carriedForward,
+            paymentDate: paymentDate,
+            dueDate: new Date(iterYear, iterMonth - 1, 1),
+            paymentMethod: paymentMethod,
+            status: paidForThisMonth >= expectedAmount ? 'paid' : (paidForThisMonth > 0 ? 'partial' : 'pending'),
+            month: monthStr,
+            year: iterYear,
+            transactionId: transactionId,
+            referenceNumber: transactionId,
+            receivedFrom,
+            houseNumber,
+            paymentSource,
+            receiptNumber,
+            isAdvance,
+            notes: `${notes}. allocated ${paidForThisMonth}${overpaymentForThisMonth > 0 ? ` + ${overpaymentForThisMonth} overpayment` : ''}`
+        });
+        await newPayment.save();
+        processedPayments.push(newPayment);
+    }
+
+    if (remainingAmount <= 0) break;
+
+    // Move to next month
+    iterMonth++;
+    if (iterMonth > 12) {
+        iterMonth = 1;
+        iterYear++;
+    }
+  }
+  return processedPayments;
+}
 
 // M-Pesa C2B Validation URL (optional, called before confirmation)
 // M-Pesa calls this to validate the account number before processing payment
@@ -536,117 +720,52 @@ router.post('/paybill', async (req, res) => {
       return res.status(400).json({ message: 'Account number (house number) and amount are required' });
     }
 
-    // Find house by house number (account number)
-    const house = await House.findOne({ houseNumber: accountNumber.trim() })
-      .populate('apartment')
-      .populate('tenant');
-
-    if (!house) {
-      return res.status(404).json({ 
-        message: `House with number ${accountNumber} not found`,
-        accountNumber: accountNumber,
-        suggestion: 'Please verify the house number and try again'
-      });
-    }
-
-    if (!house.tenant) {
-      return res.status(400).json({ 
-        message: `House ${accountNumber} has no tenant assigned`,
-        accountNumber: accountNumber
-      });
-    }
-
-    // Check for existing payment with same transaction ID
-    if (transactionId) {
-      const existingPayment = await Payment.findOne({ transactionId });
-      if (existingPayment) {
-        return res.status(400).json({ 
-          message: 'Payment with this transaction ID already exists',
-          receiptNumber: existingPayment.receiptNumber
-        });
-      }
-    }
-
-    // Determine month and year
-    const now = new Date();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const year = now.getFullYear();
-
-    // Check if payment already exists for this month/year
-    const existingPayment = await Payment.findOne({
-      house: house._id,
-      tenant: house.tenant._id,
-      month,
-      year,
-      status: 'paid'
-    });
-
-    if (existingPayment) {
-      return res.status(400).json({ 
-        message: `Payment already exists for house ${accountNumber} for ${month}/${year}`,
-        existingPayment: existingPayment._id,
-        receiptNumber: existingPayment.receiptNumber
-      });
-    }
-
-    // Calculate due date (first of the month)
-    const dueDate = new Date(year, parseInt(month) - 1, 1);
-
-    // Determine status
-    let status = 'paid';
-    if (amount < house.rentAmount) {
-      status = 'partial';
-    }
-
-    // Generate receipt number
-    const count = await Payment.countDocuments();
-    const receiptNumber = `RCP-${year}-${String(count + 1).padStart(6, '0')}`;
-
-    // Create payment
-    const payment = new Payment({
-      tenant: house.tenant._id,
-      house: house._id,
+    const processedPayments = await processMultiMonthPayment({
+      houseNumber: accountNumber.trim(),
       amount: parseFloat(amount),
-      paymentDate: now,
-      dueDate: dueDate,
-      paymentMethod: paymentMethod,
-      status: status,
-      month: month,
-      year: year,
       transactionId: transactionId || referenceNumber,
-      referenceNumber: referenceNumber,
-      receivedFrom: phoneNumber || house.tenant.firstName + ' ' + house.tenant.lastName,
-      houseNumber: accountNumber,
+      paymentDate: new Date(),
+      paymentMethod,
       paymentSource: 'paybill',
-      receiptNumber: receiptNumber,
-      notes: notes || `Paybill payment received for house ${accountNumber}${phoneNumber ? ` from ${phoneNumber}` : ''}`
+      receivedFrom: phoneNumber || 'Unknown',
+      notes: notes || `Paybill payment received for house ${accountNumber}`
     });
 
-    await payment.save();
+    return res.status(200).json({
+      message: 'Paybill payment processed successfully',
+      payments: processedPayments,
+      count: processedPayments.length
+    });
 
-    const populatedPayment = await Payment.findById(payment._id)
-      .populate('tenant', 'firstName lastName email phone')
-      .populate({
-        path: 'house',
-        populate: {
-          path: 'apartment',
-          select: 'name address'
-        }
-      });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
 
-    res.status(201).json({
-      message: 'Paybill payment received and recorded successfully',
-      payment: populatedPayment,
-      receiptNumber: receiptNumber,
-      tenant: {
-        name: `${house.tenant.firstName} ${house.tenant.lastName}`,
-        phone: house.tenant.phone,
-        email: house.tenant.email
-      },
-      house: {
-        number: house.houseNumber,
-        apartment: house.apartment?.name
-      }
+// Receive payment via webhook/API (for external payment systems)
+router.post('/receive', async (req, res) => {
+  try {
+    const { houseNumber, amount, transactionId, referenceNumber, receivedFrom, paymentMethod, notes } = req.body;
+
+    if (!houseNumber || !amount) {
+      return res.status(400).json({ message: 'House number and amount are required' });
+    }
+
+    const processedPayments = await processMultiMonthPayment({
+      houseNumber: houseNumber.trim(),
+      amount: parseFloat(amount),
+      transactionId: transactionId || referenceNumber,
+      paymentDate: new Date(),
+      paymentMethod: paymentMethod || 'bank_transfer',
+      paymentSource: 'api',
+      receivedFrom: receivedFrom || 'External System',
+      notes: notes || `External payment received via /receive`
+    });
+
+    res.json({
+      message: 'Payment received successfully',
+      payments: processedPayments,
+      count: processedPayments.length
     });
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -864,6 +983,115 @@ router.get('/analytics/payment-status', async (req, res) => {
     }
     
     res.json(data);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Batch mark payments as paid
+router.post('/batch-mark-paid', authenticate, authorize('superadmin', 'caretaker'), async (req, res) => {
+  try {
+    const { houseIds, month, year, paymentMethod = 'cash' } = req.body;
+    
+    if (!houseIds || !Array.isArray(houseIds) || houseIds.length === 0) {
+      return res.status(400).json({ message: 'House IDs array is required' });
+    }
+
+    if (!month || !year) {
+      return res.status(400).json({ message: 'Month and year are required' });
+    }
+
+    const results = {
+      success: 0,
+      failed: 0,
+      errors: []
+    };
+
+    for (const houseId of houseIds) {
+      try {
+        const house = await House.findById(houseId).populate('tenant');
+        if (!house || !house.tenant) {
+          results.failed++;
+          results.errors.push(`House ${houseId} or its tenant not found/inactive`);
+          continue;
+        }
+
+        const apartment = await Apartment.findById(house.apartment);
+        const isCaretaker = apartment?.caretakerHouse?.toString() === house._id.toString();
+
+        // Calculate expected amount
+        let carriedForward = 0;
+        const prevMonth = parseInt(month) - 1;
+        const prevYear = prevMonth === 0 ? parseInt(year) - 1 : parseInt(year);
+        const prevMonthStr = prevMonth === 0 ? '12' : String(prevMonth).padStart(2, '0');
+        
+        const prevPayment = await Payment.findOne({
+          tenant: house.tenant._id,
+          house: house._id,
+          month: prevMonthStr,
+          year: prevYear
+        }).sort({ createdAt: -1 });
+
+        if (prevPayment && prevPayment.deficit > 0) {
+          carriedForward = prevPayment.deficit;
+        }
+
+        const rentAmount = isCaretaker ? 0 : (house.rentAmount || 0);
+        const expectedAmount = rentAmount + carriedForward;
+
+        // Find or create payment for target month
+        let payment = await Payment.findOne({
+          tenant: house.tenant._id,
+          house: house._id,
+          month: month,
+          year: year
+        });
+
+        if (payment) {
+          // Update existing
+          payment.status = 'paid';
+          payment.paidAmount = expectedAmount;
+          payment.expectedAmount = expectedAmount;
+          payment.deficit = 0;
+          payment.paymentMethod = paymentMethod;
+          payment.paymentDate = new Date();
+        } else {
+          // Create new
+          const count = await Payment.countDocuments();
+          const receiptNumber = `RCP-${year}-${String(count + 1).padStart(6, '0')}`;
+          const dueDate = new Date(year, parseInt(month) - 1, 1);
+
+          payment = new Payment({
+            tenant: house.tenant._id,
+            house: house._id,
+            amount: expectedAmount,
+            expectedAmount: expectedAmount,
+            paidAmount: expectedAmount,
+            deficit: 0,
+            carriedForward: carriedForward,
+            dueDate: dueDate,
+            paymentDate: new Date(),
+            month: month,
+            year: year,
+            status: 'paid',
+            paymentMethod: paymentMethod,
+            receiptNumber: receiptNumber,
+            notes: 'Batch collection update'
+          });
+        }
+
+        await payment.save();
+        results.success++;
+      } catch (error) {
+        results.failed++;
+        results.errors.push(`Error processing house ${houseId}: ${error.message}`);
+      }
+    }
+
+    res.json({
+      message: `Successfully processed ${results.success} payments. ${results.failed} failed.`,
+      ...results
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
