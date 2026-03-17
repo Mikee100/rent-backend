@@ -4,9 +4,31 @@ import Expense from '../models/Expense.js';
 import Tenant from '../models/Tenant.js';
 import House from '../models/House.js';
 import Apartment from '../models/Apartment.js';
+import MaintenanceRequest from '../models/MaintenanceRequest.js';
 import { authenticate, filterByApartment, authorize } from '../middleware/auth.js';
 
 const router = express.Router();
+
+const parseMonthYear = (month, year) => {
+  const monthNum = parseInt(month, 10);
+  const yearNum = parseInt(year, 10);
+
+  if (Number.isNaN(monthNum) || monthNum < 1 || monthNum > 12) {
+    return { error: 'Invalid month. Use 1-12.' };
+  }
+  if (Number.isNaN(yearNum) || yearNum < 1970) {
+    return { error: 'Invalid year.' };
+  }
+
+  const monthStr = String(monthNum).padStart(2, '0');
+  return { monthNum, yearNum, monthStr };
+};
+
+const monthRange = (monthNum, yearNum) => {
+  const start = new Date(Date.UTC(yearNum, monthNum - 1, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(yearNum, monthNum, 1, 0, 0, 0, 0));
+  return { start, end };
+};
 
 // Income Statement (Revenue vs Expenses)
 router.get('/income-statement', authenticate, filterByApartment, async (req, res) => {
@@ -107,6 +129,440 @@ router.get('/income-statement', authenticate, filterByApartment, async (req, res
       netIncome: netIncome,
       paymentCount: validPayments.length,
       expenseCount: expenses.length
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Monthly Apartments Report (revenue + issues per apartment for a given month)
+router.get('/apartments-monthly', authenticate, filterByApartment, async (req, res) => {
+  try {
+    const { month, year } = req.query;
+
+    if (!month || !year) {
+      return res.status(400).json({ message: 'Month and year are required' });
+    }
+
+    const parsed = parseMonthYear(month, year);
+    if (parsed.error) {
+      return res.status(400).json({ message: parsed.error });
+    }
+
+    const { monthNum, yearNum, monthStr } = parsed;
+    const { start, end } = monthRange(monthNum, yearNum);
+
+    // Determine which apartments are in-scope (caretakers: only their apartment)
+    let apartmentsQuery = {};
+    if (req.apartmentFilter && req.apartmentFilter.apartment) {
+      apartmentsQuery = { _id: req.apartmentFilter.apartment };
+    }
+
+    const apartments = await Apartment.find(apartmentsQuery).select('_id name address caretakerHouse');
+    const apartmentIds = apartments.map(a => a._id);
+
+    // Map caretaker houses for exclusion
+    const caretakerHouseIds = new Set(
+      apartments
+        .filter(a => a.caretakerHouse)
+        .map(a => a.caretakerHouse.toString())
+    );
+
+    // Load all houses for in-scope apartments (for expected amounts + unit counts)
+    const houses = await House.find({ apartment: { $in: apartmentIds } })
+      .select('_id apartment houseNumber rentAmount')
+      .sort({ houseNumber: 1 });
+    const houseIds = houses.map((h) => h._id);
+
+    // Payments for the month/year (all statuses) so we can compute expected vs paid
+    const payments = await Payment.find({
+      house: { $in: houseIds },
+      month: monthStr,
+      year: yearNum
+    })
+      .populate({
+        path: 'house',
+        select: 'houseNumber apartment rentAmount',
+        populate: { path: 'apartment', select: 'name address caretakerHouse' }
+      });
+
+    // Cash received during the selected period (paymentDate-based) to capture advances for future months
+    const cashReceived = await Payment.find({
+      house: { $in: houseIds },
+      paymentDate: { $gte: start, $lt: end },
+      status: { $in: ['paid', 'partial'] }
+    })
+      .populate('tenant', 'firstName lastName')
+      .populate({
+        path: 'house',
+        select: 'houseNumber apartment',
+        populate: { path: 'apartment', select: 'name address caretakerHouse' }
+      });
+
+    // Group payments by house for unit-level computations
+    const paymentsByHouse = payments.reduce((acc, p) => {
+      const key = (p.house?._id || p.house)?.toString();
+      if (!key) return acc;
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(p);
+      return acc;
+    }, {});
+
+    const isPaidLike = (p) => ['paid', 'partial'].includes(p.status);
+    const isFutureOf = (p, monthStrRef, yearNumRef) => {
+      const pYear = parseInt(p.year, 10);
+      const pMonth = parseInt(p.month, 10);
+      const refMonth = parseInt(monthStrRef, 10);
+      if (Number.isNaN(pYear) || Number.isNaN(pMonth)) return false;
+      if (pYear > yearNumRef) return true;
+      if (pYear === yearNumRef && pMonth > refMonth) return true;
+      return false;
+    };
+
+    // Fetch maintenance issues opened within the month
+    const maintenanceQuery = {
+      requestedDate: { $gte: start, $lt: end }
+    };
+    if (apartmentIds.length > 0 && apartmentsQuery._id) {
+      maintenanceQuery.apartment = { $in: apartmentIds };
+    }
+
+    const issues = await MaintenanceRequest.find(maintenanceQuery)
+      .populate('apartment', 'name address')
+      .populate('house', 'houseNumber')
+      .populate('tenant', 'firstName lastName');
+
+    // Aggregate by apartment
+    const byApartment = {};
+    apartments.forEach((apt) => {
+      byApartment[apt._id.toString()] = {
+        apartmentId: apt._id,
+        apartmentName: apt.name,
+        address: apt.address,
+        housesCount: 0,
+        clearedHouses: 0,
+        dueHouses: 0,
+        totalExpected: 0,
+        totalPaid: 0,
+        outstanding: 0,
+        overpaid: 0,
+        advances: 0,
+        revenue: 0, // alias of totalPaid for compatibility
+        lateFees: 0,
+        totalCollected: 0, // totalPaid + lateFees
+        paymentCount: 0, // number of paid/partial payment records
+        notes: [],
+        advanceReceived: 0, // cash received during this period for future months
+        advanceReceivedCount: 0,
+        advanceReceivedItems: [],
+        issues: {
+          count: 0,
+          totalCost: 0,
+          byStatus: {},
+          byPriority: {},
+          byCategory: {},
+          items: []
+        }
+      };
+    });
+
+    // Houses + payments → expected/paid/overpaid/outstanding + rollups
+    houses.forEach((house) => {
+      const houseId = house._id.toString();
+      if (caretakerHouseIds.has(houseId)) return; // Exclude caretaker unit from billing totals
+
+      const aptId = house.apartment.toString();
+      if (!byApartment[aptId]) {
+        byApartment[aptId] = {
+          apartmentId: house.apartment,
+          apartmentName: 'Unknown',
+          address: null,
+          housesCount: 0,
+          clearedHouses: 0,
+          dueHouses: 0,
+          totalExpected: 0,
+          totalPaid: 0,
+          outstanding: 0,
+          overpaid: 0,
+          advances: 0,
+          revenue: 0,
+          lateFees: 0,
+          totalCollected: 0,
+          paymentCount: 0,
+          notes: [],
+          advanceReceived: 0,
+          advanceReceivedCount: 0,
+          advanceReceivedItems: [],
+          issues: {
+            count: 0,
+            totalCost: 0,
+            byStatus: {},
+            byPriority: {},
+            byCategory: {},
+            items: []
+          }
+        };
+      }
+
+      const housePayments = paymentsByHouse[houseId] || [];
+      const paidPayments = housePayments.filter(isPaidLike);
+
+      const expected =
+        (housePayments[0]?.expectedAmount ?? housePayments[0]?.amount ?? house.rentAmount ?? 0);
+
+      const paid = paidPayments.reduce((sum, p) => sum + (p.paidAmount || p.amount || 0), 0);
+      const lateFees = paidPayments.reduce((sum, p) => sum + (p.lateFee || 0), 0);
+      const advances = paidPayments.reduce((sum, p) => sum + (p.isAdvance ? (p.paidAmount || p.amount || 0) : 0), 0);
+
+      const explicitOverpaid = paidPayments.reduce((sum, p) => sum + (p.overpayment || 0), 0);
+      const computedOverpaid = Math.max(0, paid - expected);
+      const overpaid = Math.max(explicitOverpaid, computedOverpaid);
+      const outstanding = Math.max(0, expected - paid);
+      const isCleared = outstanding <= 0;
+
+      const apt = byApartment[aptId];
+      apt.housesCount += 1;
+      apt.totalExpected += expected;
+      apt.totalPaid += paid;
+      apt.revenue += paid;
+      apt.lateFees += lateFees;
+      apt.totalCollected += (paid + lateFees);
+      apt.paymentCount += paidPayments.length;
+      apt.advances += advances;
+      apt.overpaid += overpaid;
+      apt.outstanding += outstanding;
+      if (isCleared) apt.clearedHouses += 1;
+      else apt.dueHouses += 1;
+    });
+
+    // Allocate "advance received" cash (future month payments received within this period)
+    const validCashReceived = cashReceived.filter((p) => {
+      const houseId = (p.house?._id || p.house)?.toString();
+      if (!houseId) return false;
+      if (caretakerHouseIds.has(houseId)) return false;
+      return true;
+    });
+
+    validCashReceived.forEach((p) => {
+      if (!isFutureOf(p, monthStr, yearNum) && !p.isAdvance) return;
+      const aptId = p.house?.apartment?._id?.toString();
+      if (!aptId || !byApartment[aptId]) return;
+
+      const amt = p.paidAmount || p.amount || 0;
+      byApartment[aptId].advanceReceived += amt;
+      byApartment[aptId].advanceReceivedCount += 1;
+      byApartment[aptId].advanceReceivedItems.push({
+        paymentId: p._id,
+        tenantName: p.tenant ? `${p.tenant.firstName} ${p.tenant.lastName}` : null,
+        houseNumber: p.house?.houseNumber || null,
+        forMonth: p.month,
+        forYear: p.year,
+        amount: amt
+      });
+    });
+
+    // Issues → maintenance
+    issues.forEach((i) => {
+      const aptId = (i.apartment?._id || i.apartment)?.toString();
+      if (!aptId) return;
+      if (!byApartment[aptId]) {
+        byApartment[aptId] = {
+          apartmentId: i.apartment?._id || i.apartment,
+          apartmentName: i.apartment?.name || 'Unknown',
+          address: i.apartment?.address,
+          housesCount: 0,
+          clearedHouses: 0,
+          dueHouses: 0,
+          totalExpected: 0,
+          totalPaid: 0,
+          outstanding: 0,
+          overpaid: 0,
+          advances: 0,
+          revenue: 0,
+          lateFees: 0,
+          totalCollected: 0,
+          paymentCount: 0,
+          notes: [],
+          advanceReceived: 0,
+          advanceReceivedCount: 0,
+          advanceReceivedItems: [],
+          issues: {
+            count: 0,
+            totalCost: 0,
+            byStatus: {},
+            byPriority: {},
+            byCategory: {},
+            items: []
+          }
+        };
+      }
+
+      const status = i.status || 'pending';
+      const priority = i.priority || 'medium';
+      const category = i.category || 'other';
+      const cost = i.cost || 0;
+
+      byApartment[aptId].issues.count += 1;
+      byApartment[aptId].issues.totalCost += cost;
+      byApartment[aptId].issues.byStatus[status] = (byApartment[aptId].issues.byStatus[status] || 0) + 1;
+      byApartment[aptId].issues.byPriority[priority] = (byApartment[aptId].issues.byPriority[priority] || 0) + 1;
+      byApartment[aptId].issues.byCategory[category] = (byApartment[aptId].issues.byCategory[category] || 0) + 1;
+
+      byApartment[aptId].issues.items.push({
+        id: i._id,
+        title: i.title,
+        category,
+        priority,
+        status,
+        cost,
+        requestedDate: i.requestedDate,
+        completedDate: i.completedDate || null,
+        houseNumber: i.house?.houseNumber || null,
+        tenantName: i.tenant ? `${i.tenant.firstName} ${i.tenant.lastName}` : null
+      });
+    });
+
+    // Build notes per apartment (similar to Monthly Houses PDF notes)
+    Object.values(byApartment).forEach((apt) => {
+      const notes = [];
+      const periodLabel = `${monthStr}/${yearNum}`;
+
+      notes.push(
+        `This report summarizes rent performance for ${apt.housesCount} houses in ${apt.apartmentName} for ${periodLabel}.`
+      );
+
+      if (apt.clearedHouses > 0) {
+        notes.push(`${apt.clearedHouses} house(s) are fully cleared for this period.`);
+      }
+
+      if ((apt.outstanding || 0) > 0 && apt.dueHouses > 0) {
+        notes.push(
+          `${apt.dueHouses} house(s) still have outstanding balances, contributing to the total outstanding shown above.`
+        );
+      } else if ((apt.totalExpected || 0) > 0 && (apt.outstanding || 0) === 0 && (apt.totalPaid || 0) >= (apt.totalExpected || 0)) {
+        notes.push(`All rent for this period has been fully collected; there are no outstanding balances.`);
+      }
+
+      if ((apt.overpaid || 0) > 0) {
+        notes.push(`Overpayments were recorded during this period and are reflected in the overpaid total shown above.`);
+      }
+
+      if ((apt.advances || 0) > 0) {
+        notes.push(`Any advance payments or adjustments are reflected in the advances total where applicable.`);
+      } else {
+        notes.push(`Any advance payments or adjustments are reflected in individual house balances where applicable.`);
+      }
+
+      if ((apt.advanceReceived || 0) > 0) {
+        notes.push(
+          `Advance collections received this period (paid for future months): KSh ${(apt.advanceReceived || 0).toLocaleString()}.`
+        );
+      }
+
+      notes.push(
+        `Caretaker or management houses (if configured in the apartment settings) may be excluded from billing totals.`
+      );
+
+      apt.notes = notes;
+    });
+
+    const apartmentsReport = Object.values(byApartment)
+      .map((a) => ({
+        ...a,
+        issues: {
+          ...a.issues,
+          items: a.issues.items.sort((x, y) => new Date(y.requestedDate) - new Date(x.requestedDate))
+        }
+      }))
+      .sort((a, b) => (b.totalCollected || 0) - (a.totalCollected || 0));
+
+    const totals = apartmentsReport.reduce((acc, a) => {
+      acc.housesCount += a.housesCount || 0;
+      acc.clearedHouses += a.clearedHouses || 0;
+      acc.dueHouses += a.dueHouses || 0;
+      acc.totalExpected += a.totalExpected || 0;
+      acc.totalPaid += a.totalPaid || 0;
+      acc.outstanding += a.outstanding || 0;
+      acc.overpaid += a.overpaid || 0;
+      acc.advances += a.advances || 0;
+      acc.advanceReceived += a.advanceReceived || 0;
+      acc.advanceReceivedCount += a.advanceReceivedCount || 0;
+      acc.revenue += a.revenue || 0;
+      acc.lateFees += a.lateFees || 0;
+      acc.totalCollected += a.totalCollected || 0;
+      acc.paymentCount += a.paymentCount || 0;
+      acc.issuesCount += a.issues?.count || 0;
+      acc.issuesCost += a.issues?.totalCost || 0;
+      return acc;
+    }, {
+      housesCount: 0,
+      clearedHouses: 0,
+      dueHouses: 0,
+      totalExpected: 0,
+      totalPaid: 0,
+      outstanding: 0,
+      overpaid: 0,
+      advances: 0,
+      advanceReceived: 0,
+      advanceReceivedCount: 0,
+      revenue: 0,
+      lateFees: 0,
+      totalCollected: 0,
+      paymentCount: 0,
+      issuesCount: 0,
+      issuesCost: 0
+    });
+
+    const portfolioNotes = [];
+    const periodLabel = `${monthStr}/${yearNum}`;
+    portfolioNotes.push(`This report summarizes rent performance for ${totals.housesCount} houses across all apartments for ${periodLabel}.`);
+    if (totals.clearedHouses > 0) portfolioNotes.push(`${totals.clearedHouses} house(s) are fully cleared for this period.`);
+    if ((totals.outstanding || 0) > 0 && totals.dueHouses > 0) {
+      portfolioNotes.push(`${totals.dueHouses} house(s) still have outstanding balances, contributing to the total outstanding shown above.`);
+    } else if ((totals.totalExpected || 0) > 0 && (totals.outstanding || 0) === 0 && (totals.totalPaid || 0) >= (totals.totalExpected || 0)) {
+      portfolioNotes.push(`All rent for this period has been fully collected; there are no outstanding balances.`);
+    }
+    if ((totals.overpaid || 0) > 0) portfolioNotes.push(`Overpayments were recorded during this period and are reflected in the overpaid total shown above.`);
+    portfolioNotes.push(`Any advance payments or adjustments are reflected in individual house balances where applicable.`);
+    if ((totals.advanceReceived || 0) > 0) {
+      portfolioNotes.push(
+        `Advance collections received this period (paid for future months): KSh ${(totals.advanceReceived || 0).toLocaleString()}.`
+      );
+
+      const portfolioAdvanceItems = apartmentsReport
+        .flatMap((a) => (Array.isArray(a.advanceReceivedItems) ? a.advanceReceivedItems.map((i) => ({
+          ...i,
+          apartmentName: a.apartmentName
+        })) : []))
+        .sort((a, b) => (b.amount || 0) - (a.amount || 0));
+
+      if (portfolioAdvanceItems.length > 0) {
+        const top = portfolioAdvanceItems.slice(0, 8).map((i) => {
+          const apt = i.apartmentName || 'Apartment';
+          const houseLabel = i.houseNumber ? `House ${i.houseNumber}` : 'House';
+          const who = i.tenantName ? i.tenantName : 'Unknown tenant';
+          const period = `${String(i.forMonth || '').padStart(2, '0')}/${i.forYear || ''}`;
+          const amt = (i.amount || 0).toLocaleString();
+          return `${apt} – ${houseLabel} (${who}): KSh ${amt} paid for ${period}.`;
+        });
+        portfolioNotes.push(`Advance details: ${top.join(' ')}`);
+        if (portfolioAdvanceItems.length > top.length) {
+          portfolioNotes.push(`(Showing ${top.length} of ${portfolioAdvanceItems.length} advance entries.)`);
+        }
+      }
+    }
+    portfolioNotes.push(`Caretaker or management houses (if configured in the apartment settings) may be excluded from billing totals.`);
+
+    res.json({
+      period: {
+        month: monthStr,
+        year: yearNum,
+        startDate: start.toISOString(),
+        endDate: end.toISOString()
+      },
+      totals,
+      notes: portfolioNotes,
+      apartments: apartmentsReport
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -452,11 +908,52 @@ router.get('/monthly-apartment-units', authenticate, filterByApartment, async (r
       year: yearNum
     });
 
+    // Also load cash received during this period that was allocated to future months (advance)
+    const { start, end } = monthRange(monthNum, yearNum);
+    const cashReceived = await Payment.find({
+      house: { $in: houseIds },
+      paymentDate: { $gte: start, $lt: end },
+      status: { $in: ['paid', 'partial'] }
+    }).select('house month year paidAmount amount isAdvance status paymentDate');
+
     // Group payments by house
     const paymentsByHouse = payments.reduce((acc, payment) => {
       const key = payment.house.toString();
       if (!acc[key]) acc[key] = [];
       acc[key].push(payment);
+      return acc;
+    }, {});
+
+    const houseMetaById = houses.reduce((acc, h) => {
+      acc[h._id.toString()] = {
+        houseNumber: h.houseNumber,
+        tenantName: h.tenant ? `${h.tenant.firstName} ${h.tenant.lastName}` : null
+      };
+      return acc;
+    }, {});
+
+    const advanceReceivedItems = [];
+
+    const advanceReceivedByHouse = cashReceived.reduce((acc, p) => {
+      const houseKey = p.house?.toString();
+      if (!houseKey) return acc;
+      const isFuture = (parseInt(p.year, 10) > yearNum) ||
+        (parseInt(p.year, 10) === yearNum && parseInt(p.month, 10) > monthNum);
+      if (!p.isAdvance && !isFuture) return acc;
+      const amt = p.paidAmount || p.amount || 0;
+      acc[houseKey] = (acc[houseKey] || 0) + amt;
+
+      const meta = houseMetaById[houseKey] || {};
+      advanceReceivedItems.push({
+        paymentId: p._id,
+        houseId: p.house,
+        houseNumber: meta.houseNumber || null,
+        tenantName: meta.tenantName || null,
+        forMonth: p.month,
+        forYear: p.year,
+        amount: amt
+      });
+
       return acc;
     }, {});
 
@@ -488,6 +985,7 @@ router.get('/monthly-apartment-units', authenticate, filterByApartment, async (r
 
       const unitAdvance = housePayments.reduce((sum, p) => sum + (p.isAdvance ? (p.paidAmount || p.amount || 0) : 0), 0);
       const unitOverpayment = housePayments.reduce((sum, p) => sum + (p.overpayment || 0), 0);
+      const advanceReceived = isCaretaker ? 0 : (advanceReceivedByHouse[key] || 0);
 
       return {
         houseId: house._id,
@@ -500,7 +998,8 @@ router.get('/monthly-apartment-units', authenticate, filterByApartment, async (r
         isCleared: totalDeficit <= 0,
         isCaretaker,
         totalAdvance: unitAdvance,
-        totalOverpayment: unitOverpayment
+        totalOverpayment: unitOverpayment,
+        advanceReceived
       };
     });
 
@@ -510,8 +1009,12 @@ router.get('/monthly-apartment-units', authenticate, filterByApartment, async (r
       acc.totalDeficit += unit.totalDeficit;
       acc.totalAdvance += (unit.totalAdvance || 0);
       acc.totalOverpayment += (unit.totalOverpayment || 0);
+      acc.advanceReceived += (unit.advanceReceived || 0);
       return acc;
-    }, { totalExpected: 0, totalPaid: 0, totalDeficit: 0, totalAdvance: 0, totalOverpayment: 0 });
+    }, { totalExpected: 0, totalPaid: 0, totalDeficit: 0, totalAdvance: 0, totalOverpayment: 0, advanceReceived: 0 });
+
+    summary.advanceReceivedItems = advanceReceivedItems
+      .sort((a, b) => (b.amount || 0) - (a.amount || 0));
 
     res.json({
       apartment: {
