@@ -12,17 +12,25 @@ router.get('/', authenticate, filterByApartment, logActivity({
   entityType: 'tenant',
   description: (req) => {
     const role = req.user?.role || 'user';
-    return `[${role.toUpperCase()}] Viewed tenants list`;
+    const apartmentFilter = req.query.apartment ? `apartment=${req.query.apartment}` : 'all';
+    return `[${role.toUpperCase()}] Viewed tenants list (${apartmentFilter})`;
   }
 }), async (req, res) => {
   try {
     let query = {};
     
-    // Filter tenants by apartment for caretakers
-    if (req.apartmentFilter) {
+    // Support ?apartment=ID query param (for frontend filtering)
+    if (req.query.apartment) {
+      const apartmentId = req.query.apartment;
+      const houses = await House.find({ apartment: apartmentId }).select('_id');
+      const houseIds = houses.map(h => h._id);
+      query = { houses: { $in: houseIds.length > 0 ? houseIds : ['$empty'] } }; // Handle no houses
+    } 
+    // Filter tenants by apartment for caretakers (existing logic)
+    else if (req.apartmentFilter) {
       const houses = await House.find(req.apartmentFilter).select('_id');
       const houseIds = houses.map(h => h._id);
-      query = { houses: { $in: houseIds } };
+      query = { houses: { $in: houseIds.length > 0 ? houseIds : ['$empty'] } };
     }
     
     const tenants = await Tenant.find(query)
